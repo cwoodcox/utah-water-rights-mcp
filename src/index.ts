@@ -659,6 +659,58 @@ Returns JSON with:
     },
   );
 
+
+  // ── Resource: place of use GIS layer ─────────────────────────────────────────
+  // Tells agents to use ugrc-gis:arcgis_query_raw rather than a custom tool.
+
+  server.registerResource(
+    "uwr_place_of_use_layer",
+    "uwr://place-of-use/layer-info",
+    { mimeType: "application/json" },
+    async () => ({
+      contents: [{
+        uri: "uwr://place-of-use/layer-info",
+        mimeType: "application/json",
+        text: JSON.stringify({
+          instruction: "Query this layer using the ugrc-gis arcgis_query_raw tool — do NOT write custom fetch code. Pass service_url and params as shown in examples.",
+          service_url: "https://services.arcgis.com/ZzrwjTRez6FJiOq4/arcgis/rest/services/Utah_Place_of_Use_Irrigation/FeatureServer/0",
+          total_features: 67027,
+          description: "Digitized irrigation place-of-use polygons for all Utah water rights. Covers the entire state including unmanaged and closed-basin rights not in the distribution accounting API.",
+          fields: {
+            WRNUMS: "Space-separated WR numbers for this polygon — NOTE: values have a leading space (e.g. ' 13-101, 13-3509'). Always use LIKE with a leading space: LIKE '% 13-101%'.",
+            POLYGON_ACRES: "NULL in the entire dataset — do not use for acreage queries.",
+            DOCUMENT_ACRES: "NULL in the entire dataset — do not use for acreage queries.",
+            POU_TYPE: "Place of use type code (e.g. 'C' = certified). Single character. Often empty.",
+            SOURCE: "Source document type (e.g. 'ProofMap', 'Hydrographic Survey Map'). Often empty.",
+            AREA_CODE: "DWR area code — matches area_code from uwr_location_info (e.g. '13' = Box Elder County)",
+            CHNUM: "Change application number. Often empty.",
+            dbURL: "Link to the DWR POU group detail page — always populated.",
+          },
+          notes: [
+            "WRNUMS values always have a leading space — use LIKE '% 13-101%' not LIKE '%13-101%'",
+            "POLYGON_ACRES and DOCUMENT_ACRES are NULL across the entire 67,027-record dataset",
+            "Geometry is returned in UTM Zone 12N (WKID 26912) unless you specify outSR=4326",
+            "The FeatureServer returns up to 2000 records per request (exceededTransferLimit indicates more exist)",
+          ],
+          example_queries: {
+            by_wr_number: {
+              params: { f: "json", where: "WRNUMS LIKE '% 13-101%'", outFields: "WRNUMS,POLYGON_ACRES,AREA_CODE,dbURL", outSR: "4326", returnGeometry: "true", resultRecordCount: "100" },
+            },
+            by_bounding_box: {
+              params: { f: "json", where: "1=1", geometry: JSON.stringify({xmin:-113.3,ymin:41.1,xmax:-112.8,ymax:41.4}), geometryType: "esriGeometryEnvelope", inSR: "4326", spatialRel: "esriSpatialRelIntersects", outFields: "WRNUMS,POLYGON_ACRES,AREA_CODE,dbURL", outSR: "4326", returnGeometry: "false", resultRecordCount: "200" },
+            },
+            by_area_code: {
+              params: { f: "json", where: "AREA_CODE='13'", outFields: "WRNUMS,POLYGON_ACRES,AREA_CODE,dbURL", returnGeometry: "false", resultRecordCount: "500" },
+            },
+            count_only: {
+              params: { f: "json", where: "AREA_CODE='13'", returnCountOnly: "true" },
+            },
+          },
+        }, null, 2),
+      }],
+    }),
+  );
+
   return server;
 }
 
