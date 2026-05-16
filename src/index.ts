@@ -67,6 +67,169 @@ function priorityDate(raw: number | null | undefined): string | null {
   return s;
 }
 
+
+const WRINDEX_URL = "https://waterrights.utah.gov/cgi-bin/wrindex.exe";
+
+interface WrIndexRecord {
+  owner: string;
+  source: string;
+  wr_number: string;
+  type: string;
+  status: string;
+  app_number: string;
+  cert_number: string;
+  priority_date: string | null;
+  flow_cfs: number | null;
+  volume_acft: number | null;
+  detail_url: string;
+}
+
+/**
+ * Parse WRINDEX HTML into structured records.
+ * The <pre> block uses 3 lines per right: owner / source+WRnum / priority+volume
+ */
+function parseWrindexHtml(html: string): WrIndexRecord[] {
+  const preMatch = html.match(/<pre>([\s\S]*?)<\/pre>/i);
+  if (!preMatch) return [];
+  const pre = preMatch[1];
+
+  // Replace linked WR numbers with just the number text
+  const cleaned = pre
+    .replace(/<a[^>]*onclick="[^"]*\/search\?q=([^']+)'[^"]*"[^>]*>[^<]*<\/a>/gi, (_m, wrNum: string) => wrNum.trim())
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+
+  const records: WrIndexRecord[] = [];
+  const lines = cleaned.split(/\r?\n/);
+
+  let i = 0;
+  while (i < lines.length) {
+    const ownerLine = lines[i];
+    // Owner lines: non-empty, not indented, not headers/hr lines
+    if (
+      !ownerLine ||
+      ownerLine.startsWith(" ") ||
+      ownerLine.startsWith("\t") ||
+      ownerLine.trim() === "" ||
+      ownerLine.includes("---") ||
+      ownerLine.includes("Name ") ||
+      ownerLine.includes("WR/CH")
+    ) {
+      i++;
+      continue;
+    }
+
+    const owner = ownerLine.trim().replace(/,\s*$/, "");
+
+    // Find the next indented source line
+    let j = i + 1;
+    while (j < lines.length && lines[j].trim() === "") j++;
+
+    if (j >= lines.length || !lines[j].startsWith("     ")) {
+      i = j;
+      continue;
+    }
+    const sourceLine = lines[j++];
+
+    // Find the next indented priority line
+    while (j < lines.length && lines[j].trim() === "") j++;
+    let priorityLine = "";
+    if (j < lines.length && lines[j].startsWith("     ")) {
+      priorityLine = lines[j++];
+    }
+
+    // Extract WR number from the source line
+    const wrMatch = sourceLine.match(/\b(\d{1,3}-\d+|[aAeEE]\d{4,6})\b/);
+    const wrNum = wrMatch ? wrMatch[1] : "";
+
+    // Source name: everything before the WR number
+    let source = "";
+    if (wrNum && sourceLine.includes(wrNum)) {
+      source = sourceLine.slice(0, sourceLine.indexOf(wrNum)).trim();
+    } else {
+      source = sourceLine.trim();
+    }
+
+    // Type and status from text after WR number
+    const afterWr = wrNum ? sourceLine.slice(sourceLine.indexOf(wrNum) + wrNum.length) : sourceLine;
+    const typeMatch = afterWr.match(/\b(APPL|DIL|SHAR|DEC|EXCH)\b/);
+    const wrType = typeMatch ? typeMatch[1] : "";
+    const statusMatch = afterWr.match(/\b(CERT|REJ|APP|WUC|WD|DIS|NPR|UNAP|LAP)\b/);
+    const wrStatus = statusMatch ? statusMatch[1] : "";
+    const appMatch = afterWr.match(/\b(A\d{4,6}\w*)\b/);
+    const appNum = appMatch ? appMatch[1] : "";
+
+    // Priority date
+    let priorityDateStr: string | null = null;
+    let flowCfs: number | null = null;
+    let volumeAcft: number | null = null;
+
+    if (priorityLine) {
+      const dateMatch = priorityLine.match(/Priority Date:\s*(\d{2}\/\d{2}\/\d{4}|\/\s*\/\s*\d{4})/);
+      if (dateMatch) {
+        const raw = dateMatch[1].trim();
+        if (raw.startsWith("/")) {
+          const yrMatch = raw.match(/(\d{4})/);
+          if (yrMatch) priorityDateStr = yrMatch[1];
+        } else {
+          const parts = raw.split("/");
+          if (parts.length === 3) {
+            priorityDateStr = `${parts[2]}-${parts[0].padStart(2, "0")}-${parts[1].padStart(2, "0")}`;
+          }
+        }
+      }
+      const cfsMatch = priorityLine.match(/([\d,]+\.?\d*)\s*cfs/);
+      if (cfsMatch) flowCfs = parseFloat(cfsMatch[1].replace(/,/g, ""));
+      const acftMatch = priorityLine.match(/([\d,]+\.?\d*)\s*acft/);
+      if (acftMatch) volumeAcft = parseFloat(acftMatch[1].replace(/,/g, ""));
+    }
+
+    if (owner && source.length > 1) {
+      records.push({
+        owner,
+        source,
+        wr_number: wrNum,
+        type: wrType,
+        status: wrStatus,
+        app_number: appNum,
+        cert_number: "",
+        priority_date: priorityDateStr,
+        flow_cfs: flowCfs,
+        volume_acft: volumeAcft,
+        detail_url: wrNum
+          ? `https://waterrights.utah.gov/search?q=${encodeURIComponent(wrNum)}`
+          : "",
+      });
+    }
+
+    i = j;
+  }
+
+  return records;
+}
+
+async function wrindexPost(
+  searchKey: "Owner Name" | "Text Search" | "Source of Supply" | "Text Source",
+  searchString: string,
+): Promise<{ records: WrIndexRecord[]; has_more: boolean }> {
+  const body = new URLSearchParams({
+    Modinfo: "WRMain",
+    Search_Key: searchKey,
+    SEARCH_STRING: searchString,
+    Key: "Display Results",
+  });
+  const resp = await fetch(WRINDEX_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  });
+  if (!resp.ok) throw new Error(`WRINDEX HTTP ${resp.status}`);
+  const html = await resp.text();
+  const has_more = html.includes('value="Next Page"') && html.includes('name="FIRST_');
+  return { records: parseWrindexHtml(html), has_more };
+}
+
 function text(content: string) {
   return { content: [{ type: "text" as const, text: content }] };
 }
@@ -403,6 +566,99 @@ Returns: Raw JSON balance data for the zone.`,
     },
   );
 
+
+  // ── Tool: search static DB by owner name ─────────────────────────────────────
+
+  server.registerTool(
+    "uwr_search_by_owner",
+    {
+      title: "Search Water Rights by Owner Name",
+      description: `Search the static Utah water rights database by owner/entity name.
+
+This reaches the WRINDEX legacy database — covering ALL water rights in Utah including
+unmanaged, closed-basin, and historical rights that do NOT appear in the distribution
+accounting API (e.g. Hansel Valley, Salt Wells Spring, Bear River closed-basin rights).
+
+search_string is alphabetical starting point (e.g. "O'Leary" returns rights for owners
+alphabetically starting at that name). Use text_search=true for substring matching
+anywhere in the owner name rather than alphabetical lookup.
+
+Returns JSON with:
+  total_found, has_more (true if >1 page of results),
+  records: [{ owner, source, wr_number, type, status, app_number,
+              priority_date, flow_cfs, volume_acft, detail_url }]
+
+Type codes: APPL=Application, DIL=Diligence Claim, SHAR=Shares, DEC=Decree, EXCH=Exchange
+Status codes: CERT=Certified, REJ=Rejected, APP=Approved, WUC=Water Use Certificate,
+              WD=Withdrawn, DIS=Dismissed, NPR=No Priority, LAP=Lapsed`,
+      inputSchema: {
+        search_string: z.string().min(1).describe("Owner name to search for, e.g. 'O\'Leary', 'Utah Power', 'Bureau of Land Management'"),
+        text_search: z.boolean().default(false).describe("If true, searches for substring anywhere in owner name. If false (default), alphabetical starting-point lookup."),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ search_string, text_search }) => {
+      try {
+        const searchKey = text_search ? "Text Search" : "Owner Name";
+        const { records, has_more } = await wrindexPost(searchKey, search_string);
+        return text(JSON.stringify({
+          total_found: records.length,
+          has_more,
+          note: has_more ? "More results exist. Narrow your search or use a more specific name." : undefined,
+          records,
+        }, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
+  // ── Tool: search static DB by water source ────────────────────────────────────
+
+  server.registerTool(
+    "uwr_search_by_source",
+    {
+      title: "Search Water Rights by Water Source",
+      description: `Search the static Utah water rights database by water source name.
+
+This reaches the WRINDEX legacy database — the ONLY way to find water rights on
+unmanaged/closed-basin sources like Hansel Valley Springs, Salt Wells Spring,
+Bear River diversions, and other sources not covered by distribution accounting.
+
+Returns ALL rights drawing from a named source, with owner, priority date, and volume.
+Useful for: mapping who holds rights on a specific spring, stream, or well field;
+building a complete picture of water interests on land parcels.
+
+search_string is an alphabetical starting point (e.g. "Salt Wells" returns rights
+whose source name starts alphabetically at that point). Use text_search=true for
+substring matching (e.g. "Wells" finds "Salt Wells", "Gravel Wells", etc.).
+
+Returns JSON with:
+  total_found, has_more,
+  records: [{ owner, source, wr_number, type, status, app_number,
+              priority_date, flow_cfs, volume_acft, detail_url }]`,
+      inputSchema: {
+        search_string: z.string().min(1).describe("Source/spring/stream name to search, e.g. 'Hansel Valley', 'Salt Wells Spring', 'Bear River', 'Locomotive Springs'"),
+        text_search: z.boolean().default(false).describe("If true, substring match anywhere in source name. If false (default), alphabetical starting-point lookup."),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ search_string, text_search }) => {
+      try {
+        const searchKey = text_search ? "Text Source" : "Source of Supply";
+        const { records, has_more } = await wrindexPost(searchKey, search_string);
+        return text(JSON.stringify({
+          total_found: records.length,
+          has_more,
+          note: has_more ? "More results exist. Try a more specific source name." : undefined,
+          records,
+        }, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
   return server;
 }
 
@@ -421,6 +677,8 @@ export default {
           tools: [
             "uwr_county_codes",
             "uwr_location_info",
+            "uwr_search_by_owner",
+            "uwr_search_by_source",
             "uwr_waterway_network",
             "uwr_flowline_details",
             "uwr_accounting_graphs",
