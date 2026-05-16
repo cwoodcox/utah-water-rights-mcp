@@ -326,7 +326,10 @@ async function wrprintAjax(
     if (cnt) return { records: [], count: parseInt(cnt[1], 10) };
   }
 
-  const parsed = JSON.parse(raw) as { Records?: Array<Record<string, string>>; RecordCount?: string };
+  // The ASP backend emits comment fields with backslash-escaped single quotes
+  // (e.g. "well driller\'s report") — invalid JSON. Unescape before parsing.
+  const sanitized = raw.replace(/\\'/g, "'");
+  const parsed = JSON.parse(sanitized) as { Records?: Array<Record<string, string>>; RecordCount?: string };
   const records = (parsed.Records ?? []).map((r) => {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(r)) out[k] = typeof v === "string" ? v.trim() : v;
@@ -336,6 +339,174 @@ async function wrprintAjax(
 }
 
 const SAFE_WRNUM = /^[A-Za-z]?\d+(?:-\d+)?$/;
+
+// ── wrPrintAction.asp summary scraper ─────────────────────────────────────────
+// `wrPrintAction.asp?action=tab_home&wrnum=X` returns the full WR master record
+// rendered as HTML. We strip tags, walk the label/value sequence, and pull out
+// the headline fields. Whatever we don't parse cleanly is exposed as raw_text
+// so the agent can still find it.
+
+interface WrChange { app_number: string; filed: string; status: string }
+interface WrOwner { name: string; address: string[]; interest: string; remarks: string }
+interface WrPod { description: string; diverting_works: string; source: string; elevation: string; utm: string; stream_alteration_required: string }
+
+function decodeEntities(s: string): string {
+  return s.replace(/&nbsp;?/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+
+function htmlToLines(html: string): string[] {
+  let h = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
+  h = h.replace(/<[^>]+>/g, "\n");
+  h = decodeEntities(h).replace(/[ \t]+/g, " ");
+  return h.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+}
+
+function parseWrPrintAction(html: string, wrNumber: string): Record<string, unknown> {
+  const lines = htmlToLines(html);
+
+  // Section boundaries detected by header lines
+  const sectionStart = (name: string) => lines.findIndex((l) => l === name);
+  const idxChanges = sectionStart("Changes");
+  const idxOwners = sectionStart("Owners");
+  const idxGeneral = sectionStart("General");
+  const idxDates = sectionStart("Dates");
+  const idxPods = sectionStart("Points of Diversion");
+  const idxUses = sectionStart("Water Uses");
+
+  const sliceBetween = (a: number, b: number) => (a < 0 ? [] : lines.slice(a + 1, b < 0 ? lines.length : b));
+
+  // Changes: sequences of [app_number, "(Filed: MM/DD/YYYY)", status]
+  const changes: WrChange[] = [];
+  const changesLines = sliceBetween(idxChanges, idxOwners);
+  for (let i = 0; i < changesLines.length - 2; i++) {
+    const m = changesLines[i + 1].match(/^\(Filed:\s*([\d/]+)\)$/);
+    if (m) {
+      changes.push({ app_number: changesLines[i], filed: m[1], status: changesLines[i + 2] });
+      i += 2;
+    }
+  }
+
+  // Owners: repeated [Name:, value, Address:, value..., Interest:, value, Remarks:, value?]
+  const owners: WrOwner[] = [];
+  const ownersLines = sliceBetween(idxOwners, idxGeneral);
+  let current: WrOwner | null = null;
+  for (let i = 0; i < ownersLines.length; i++) {
+    const l = ownersLines[i];
+    if (l === "Name:") {
+      if (current) owners.push(current);
+      current = { name: ownersLines[++i] ?? "", address: [], interest: "", remarks: "" };
+    } else if (current && l === "Address:") {
+      while (++i < ownersLines.length && ownersLines[i] !== "Interest:" && ownersLines[i] !== "Remarks:" && ownersLines[i] !== "Name:") {
+        current.address.push(ownersLines[i]);
+      }
+      i--;
+    } else if (current && l === "Interest:") {
+      current.interest = ownersLines[++i] ?? "";
+    } else if (current && l === "Remarks:") {
+      const next = ownersLines[i + 1];
+      if (next && next !== "Name:") current.remarks = ownersLines[++i] ?? "";
+    }
+  }
+  if (current) owners.push(current);
+
+  // General: label/value pairs
+  const general: Record<string, string> = {};
+  const generalLines = sliceBetween(idxGeneral, idxDates);
+  for (let i = 0; i < generalLines.length; i++) {
+    const l = generalLines[i];
+    if (l.endsWith(":") && i + 1 < generalLines.length) {
+      const next = generalLines[i + 1];
+      if (!next.endsWith(":")) {
+        general[l.slice(0, -1).trim()] = next;
+        i++;
+      }
+    } else {
+      // "Type of Right: Pending Adjudication Claim" — label and value on same line
+      const m = l.match(/^([A-Z][^:]+):\s+(.+)$/);
+      if (m) general[m[1].trim()] = m[2].trim();
+    }
+  }
+
+  // Dates: same label/value pattern as general; section can repeat (Filing/Approval/Certification subsections)
+  const datesRaw = sliceBetween(idxDates, idxPods);
+  const dates: Record<string, string> = {};
+  for (let i = 0; i < datesRaw.length; i++) {
+    const l = datesRaw[i];
+    if (l.endsWith(":") && i + 1 < datesRaw.length) {
+      const next = datesRaw[i + 1];
+      if (!next.endsWith(":")) {
+        const key = l.slice(0, -1).trim();
+        if (!dates[key]) dates[key] = next;
+        i++;
+      }
+    }
+  }
+
+  // PODs: each starts with "(N)" and follows with Diverting Works, Source, Elevation, UTM
+  const pods: WrPod[] = [];
+  const podLines = sliceBetween(idxPods, idxUses);
+  let pod: Partial<WrPod> | null = null;
+  const PodFieldMap: Record<string, "diverting_works" | "source" | "elevation" | "utm"> = {
+    "Diverting Works": "diverting_works",
+    Source: "source",
+    Elevation: "elevation",
+    UTM: "utm",
+  };
+  for (let i = 0; i < podLines.length; i++) {
+    const l = podLines[i];
+    if (/^\(\d+\)/.test(l)) {
+      if (pod) pods.push({ description: "", diverting_works: "", source: "", elevation: "", utm: "", stream_alteration_required: "", ...pod } as WrPod);
+      pod = { description: l };
+    } else if (pod && l.startsWith("Stream Alteration Required:")) {
+      pod.stream_alteration_required = l.split(":").slice(1).join(":").trim();
+    } else if (pod && l.endsWith(":")) {
+      // Peek ahead: only consume the next line as a value if it isn't another label
+      // or the start of a new POD. PODs commonly have label-only entries when the
+      // field is empty (Source:, Elevation:), and a naive ++i would eat the next label.
+      const key = l.slice(0, -1).trim();
+      const field = PodFieldMap[key];
+      if (field) {
+        const next = podLines[i + 1];
+        if (next && !next.endsWith(":") && !/^\(\d+\)/.test(next) && !next.startsWith("Stream Alteration Required:")) {
+          pod[field] = next;
+          i++;
+        }
+      }
+    }
+  }
+  if (pod) pods.push({ description: "", diverting_works: "", source: "", elevation: "", utm: "", stream_alteration_required: "", ...pod } as WrPod);
+
+  return {
+    wr_number: wrNumber,
+    quantity: general["Quantity of Water"] ?? null,
+    source: general["Source"] ?? null,
+    county: general["County"] ?? null,
+    type_of_right: general["Type of Right"] ?? null,
+    common_description: general["Common Description"] ?? null,
+    priority_date: dates["Priority"] ?? null,
+    filed_date: dates["Filed"] ?? null,
+    certificate_date: dates["Certificate/WUC Date"] ?? null,
+    state_engineer_action: dates["State Engineer Action"] ?? null,
+    state_engineer_action_date: dates["Action Date"] ?? null,
+    protested: dates["Protested"] ?? null,
+    owners,
+    changes,
+    points_of_diversion: pods,
+    general,
+    dates,
+    detail_url: `https://waterrights.utah.gov/search?q=${encodeURIComponent(wrNumber)}`,
+  };
+}
+
+async function wrPrintActionFetch(wrNumber: string): Promise<string> {
+  const url = `${WRPRINT_BASE}/wrPrintAction.asp?action=tab_home&wrnum=${encodeURIComponent(wrNumber)}&tab=home&companyid=0&forPublicView=0`;
+  const resp = await fetch(url, {
+    headers: { ...BROWSER_HEADERS, Referer: `${WRPRINT_BASE}/wrprint.asp?wrnum=${encodeURIComponent(wrNumber)}` },
+    redirect: "follow",
+  });
+  if (!resp.ok) throw new Error(`wrPrintAction HTTP ${resp.status}`);
+  return resp.text();
+}
 
 function text(content: string) {
   return { content: [{ type: "text" as const, text: content }] };
@@ -673,6 +844,153 @@ Returns: Raw JSON balance data for the zone.`,
     },
   );
 
+  // ── Tool: zone apportionments timeseries ────────────────────────────────────
+
+  server.registerTool(
+    "uwr_zone_apportionments",
+    {
+      title: "Get Daily Flow Apportionments for Zone",
+      description: `Return daily timeseries results for every model variable that relates to a
+specific zone (inflows, outflows, allocations, depletions). Use units='cfs' for
+flow rates or 'acft' for volumes. Use direction to limit to 'in', 'out', or
+'both' (default).`,
+      inputSchema: {
+        zone_id: z.number().int().positive().describe("Zone ID from uwr_accounting_graphs or uwr_allocations"),
+        from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("YYYY-MM-DD"),
+        to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("YYYY-MM-DD"),
+        units: z.enum(["cfs", "acft"]).optional().describe("Flow unit (default: cfs)"),
+        direction: z.enum(["in", "out", "both"]).optional().describe("Limit to inflows, outflows, or both (default: both)"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ zone_id, from_date, to_date, units, direction }) => {
+      try {
+        const params: Record<string, string> = { from_date, to_date };
+        if (units) params.units = units;
+        if (direction) params.direction = direction;
+        const data = await dwrGet(`/distribution-accounting/allocations/zones/${zone_id}`, params);
+        return text(JSON.stringify(data, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
+  // ── Tool: zone totals timeseries ────────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_zone_totals",
+    {
+      title: "Get Daily Flow Totals for Zone",
+      description: `Daily timeseries totals for every model variable that relates to a zone —
+pre-aggregated across all inflow/outflow paths.
+
+Returns: Raw JSON timeseries from the DWR allocations totals endpoint.`,
+      inputSchema: {
+        zone_id: z.number().int().positive(),
+        from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ zone_id, from_date, to_date }) => {
+      try {
+        const data = await dwrGet(`/distribution-accounting/allocations/zones/${zone_id}/totals`, { from_date, to_date });
+        return text(JSON.stringify(data, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
+  // ── Tool: flow apportionments by flow_id ────────────────────────────────────
+
+  server.registerTool(
+    "uwr_flow_apportionments",
+    {
+      title: "Get Interzone Flow Apportionments",
+      description: `Daily timeseries results for each model variable that traverses through a
+specific inter-zone flow (e.g. a canal headgate, a diversion). Use flow_id from
+graph queries.`,
+      inputSchema: {
+        flow_id: z.number().int().positive(),
+        from_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        to_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        units: z.enum(["cfs", "acft"]).optional(),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ flow_id, from_date, to_date, units }) => {
+      try {
+        const params: Record<string, string> = { from_date, to_date };
+        if (units) params.units = units;
+        const data = await dwrGet(`/distribution-accounting/allocations/${flow_id}`, params);
+        return text(JSON.stringify(data, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
+  // ── Tool: accounting graph detail ───────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_accounting_graph_detail",
+    {
+      title: "Load Stored Accounting Graph",
+      description: `Return the structure of a stored accounting graph (zones + flows between
+zones) for a given date range. graph_id comes from uwr_accounting_graphs.`,
+      inputSchema: {
+        graph_id: z.number().int().positive(),
+        beg_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ graph_id, beg_date, end_date }) => {
+      try {
+        const data = await dwrGet(`/distribution-accounting/accounting-graphs/${graph_id}`, { beg_date, end_date });
+        return text(JSON.stringify(data, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
+  // ── Tool: smoothed reservoir storage ────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_reservoir_storage",
+    {
+      title: "Get Kalman-Smoothed Reservoir Storage",
+      description: `Return smoothed reservoir storage volume timeseries, corrected by measured
+inflows/outflows. Uses Kalman smoothing on the assumption that unmeasured flows
+should be roughly constant. Standard deviations control how much weight is given
+to measured vs. modeled values.`,
+      inputSchema: {
+        resv_zone_id: z.number().int().positive().describe("Reservoir zone ID"),
+        stream_zone_id: z.number().int().positive().describe("Connected stream zone ID"),
+        sd_resv_error: z.number().describe("Standard deviation of reservoir measurement error"),
+        sd_make: z.number().describe("Standard deviation of make (unmeasured flow) variation"),
+        start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        start_res_vol: z.number().optional().describe("Initial reservoir volume (acft); optional"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ resv_zone_id, stream_zone_id, sd_resv_error, sd_make, start_date, start_res_vol }) => {
+      try {
+        const params: Record<string, string | number> = {
+          resv_zone_id, stream_zone_id, sd_resv_error, sd_make, start_date,
+        };
+        if (start_res_vol != null) params.start_res_vol = start_res_vol;
+        const data = await dwrGet("/distribution-accounting/accounting-graphs/query/corrected-reservoir-storage", params);
+        return text(JSON.stringify(data, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
 
   // ── Tool: search static DB by owner name ─────────────────────────────────────
 
@@ -767,6 +1085,48 @@ Returns JSON with:
   );
 
 
+  // ── Tool: water right master detail ──────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_water_right_detail",
+    {
+      title: "Get Water Right Master Detail",
+      description: `Fetch the full master record for a water right — priority date, quantity,
+source, county, owners, change applications, points of diversion (with UTM
+coordinates), and the milestone dates (filed, advertised, protested, approved,
+certified, lapsed).
+
+This is the headline summary view from waterrights.utah.gov's WR detail page.
+For per-use breakdowns use uwr_water_right_uses; for scanned documents use
+uwr_scanned_documents.
+
+Returns JSON with:
+  wr_number, quantity (e.g. "0.13 CFS"), source, county, type_of_right,
+  common_description, priority_date, filed_date, certificate_date,
+  state_engineer_action, protested,
+  owners: [{ name, address[], interest, remarks }],
+  changes: [{ app_number, filed, status }],
+  points_of_diversion: [{ description, diverting_works, source, elevation, utm,
+    stream_alteration_required }],
+  general: {…raw label→value from General section…},
+  dates: {…raw label→value from Dates section…},
+  detail_url.`,
+      inputSchema: {
+        wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '43-10040', '57-2634'"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ wr_number }) => {
+      try {
+        const html = await wrPrintActionFetch(wr_number);
+        const parsed = parseWrPrintAction(html, wr_number);
+        return text(JSON.stringify(parsed, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
   // ── Tool: water right uses ───────────────────────────────────────────────────
 
   server.registerTool(
@@ -814,10 +1174,12 @@ Returns: { wr_number, count, uses: [...] } — empty if the WR has no recorded u
       description: `List the scanned document index for a water right — applications, decrees,
 proofs, correspondence, legal documents, well driller's reports, etc.
 
-Each record has codedesc (human-readable doc type), docdate, comment, and a
-wwwpath + docfilen pair that points to the scanned image under /docSys/.
+Each record includes two retrieval URLs:
+  - pdf_url:    DOCDB wrapper that converts TIF to PDF (preferred for text/OCR)
+  - direct_url: raw scan (TIF/PDF) — useful for image-based viewing
 
-Returns: { wr_number, count, documents: [{ doc_seq_n, docdate, doctype, codedesc, comment, volname, wwwpath, docfilen, ... }] }`,
+Returns: { wr_number, count, documents: [{ doc_seq_n, docdate, doctype, codedesc,
+  comment, volname, recordid, pdf_url, direct_url, ... }] }`,
       inputSchema: {
         wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '43-10040'"),
         sort: z.enum(["doc_seq_n", "docdate", "codedesc", "doctype"]).default("doc_seq_n").describe("Sort key"),
@@ -832,7 +1194,15 @@ Returns: { wr_number, count, documents: [{ doc_seq_n, docdate, doctype, codedesc
           sort,
           order,
         });
-        return text(JSON.stringify({ wr_number, count, documents: records }, null, 2));
+        const documents = records.map((r) => {
+          const filePath = `${r.wwwpath ?? ""}${r.volname ?? ""}${r.docfilen ?? ""}.${r.imgtype ?? ""}`;
+          return {
+            ...r,
+            direct_url: `https://www.waterrights.utah.gov${filePath}`,
+            pdf_url: `https://www.waterrights.utah.gov/asp_apps/DOCDB/DocImageToPDF.asp?file=${filePath}`,
+          };
+        });
+        return text(JSON.stringify({ wr_number, count, documents }, null, 2));
       } catch (e) {
         return text(formatError(e));
       }
@@ -853,17 +1223,31 @@ The endpoint composes \`SELECT {columns} FROM {table} {where_clause} {order_clau
 String literals in where_clause use single quotes, e.g. WHERE wrnum='57-2634'.
 
 Known tables (non-exhaustive):
-  - water_uses       — per-use breakdown for each WR. Key: WRNUM.
-                       Cols: GROUP_NUMBER, USE_TYPE, USE_ID, IRRIGATION_ACREAGE,
-                       DOMESTIC_FAMILIES, STOCK_UNITS, MUNICIPALITY, MINE_*,
-                       POWER_*, OTHER_*, plus parallel ADJUD_* columns,
-                       USE_BEG_DATE, USE_END_DATE, ADJUD_ACTION_FLAG.
-  - owners           — current/historical owners. Key: WRCHEX (NOT WRNUM —
-                       owners may be keyed by an exchange identifier like 'E5428';
-                       to find owners by WR number try WHERE wrchex LIKE '%<wrnum>%').
-                       Cols: OWNER_NAME, OWNER_FIRST_NAME, OWNER_LAST_NAME,
-                       OWNER_ADDRESS, OWNER_CITY, OWNER_STATE, OWNER_ZIPCODE,
-                       OWNER_PHONE, OWNER_EMAIL_ADDRESS, OWNER_INTEREST.
+  - water_uses           — per-use breakdown for each WR. Key: WRNUM.
+                           Cols: GROUP_NUMBER, USE_TYPE, USE_ID,
+                           IRRIGATION_ACREAGE, DOMESTIC_FAMILIES, STOCK_UNITS,
+                           MUNICIPALITY, MINE_*, POWER_*, OTHER_*, plus parallel
+                           ADJUD_* columns, USE_BEG_DATE, USE_END_DATE,
+                           ADJUD_ACTION_FLAG.
+  - owners               — current/historical owners. Key: WRCHEX (NOT WRNUM —
+                           owners may be keyed by an exchange identifier like
+                           'E5428'; try WHERE wrchex LIKE '%<wrnum>%' to find
+                           owners by WR number).
+                           Cols: OWNER_NAME, OWNER_FIRST_NAME, OWNER_LAST_NAME,
+                           OWNER_ADDRESS, OWNER_CITY, OWNER_STATE, OWNER_ZIPCODE,
+                           OWNER_PHONE, OWNER_EMAIL_ADDRESS, OWNER_INTEREST.
+  - points_of_diversion  — physical diversion points. Key: WRCHEX.
+                           Cols: POD_TYPE, NS_DIRECTION, NS_DISTANCE,
+                           EW_DIRECTION, EW_DISTANCE, SECTION_CORNER, STR,
+                           DIVERTING_WORKS, POD_COMMENT.
+  - place_of_use         — quarter-quarter-section grid of POU. Key: WRCHEX.
+                           Cols: STR, USE_NWNW, USE_NENW, USE_NWNE, USE_NENE,
+                           USE_SWNW, USE_SENW, USE_SWNE, USE_SENE (and SW/SE
+                           quarters). Each USE_* is a flag for that 40-acre
+                           parcel within the section.
+  - group_wrnums         — WRs grouped by adjudication. Key: GROUP_NUMBER + WRNUM.
+                           Cols: SOLE_SUPPLY_IRR/STK/FAM/PER/MUN/MIN/POW/OTH.
+  - segregations         — segregation history (often sparse).
 
 To discover more tables, try \`tableNameId\` values and read the error response —
 "No RecordSet to convert to JSON" means the query failed (bad table/column/SQL).
@@ -965,15 +1349,21 @@ export default {
             "uwr_location_info",
             "uwr_search_by_owner",
             "uwr_search_by_source",
+            "uwr_water_right_detail",
             "uwr_water_right_uses",
             "uwr_scanned_documents",
             "uwr_wrdb_query",
             "uwr_waterway_network",
             "uwr_flowline_details",
             "uwr_accounting_graphs",
+            "uwr_accounting_graph_detail",
             "uwr_allocations",
             "uwr_allocations_summary",
             "uwr_zone_balance",
+            "uwr_zone_apportionments",
+            "uwr_zone_totals",
+            "uwr_flow_apportionments",
+            "uwr_reservoir_storage",
           ],
           source: "waterrights.utah.gov public API",
         }, null, 2),
