@@ -326,7 +326,10 @@ async function wrprintAjax(
     if (cnt) return { records: [], count: parseInt(cnt[1], 10) };
   }
 
-  const parsed = JSON.parse(raw) as { Records?: Array<Record<string, string>>; RecordCount?: string };
+  // The ASP backend emits comment fields with backslash-escaped single quotes
+  // (e.g. "well driller\'s report") — invalid JSON. Unescape before parsing.
+  const sanitized = raw.replace(/\\'/g, "'");
+  const parsed = JSON.parse(sanitized) as { Records?: Array<Record<string, string>>; RecordCount?: string };
   const records = (parsed.Records ?? []).map((r) => {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(r)) out[k] = typeof v === "string" ? v.trim() : v;
@@ -443,16 +446,33 @@ function parseWrPrintAction(html: string, wrNumber: string): Record<string, unkn
   const pods: WrPod[] = [];
   const podLines = sliceBetween(idxPods, idxUses);
   let pod: Partial<WrPod> | null = null;
+  const PodFieldMap: Record<string, "diverting_works" | "source" | "elevation" | "utm"> = {
+    "Diverting Works": "diverting_works",
+    Source: "source",
+    Elevation: "elevation",
+    UTM: "utm",
+  };
   for (let i = 0; i < podLines.length; i++) {
     const l = podLines[i];
     if (/^\(\d+\)/.test(l)) {
       if (pod) pods.push({ description: "", diverting_works: "", source: "", elevation: "", utm: "", stream_alteration_required: "", ...pod } as WrPod);
       pod = { description: l };
-    } else if (pod && l === "Diverting Works:") pod.diverting_works = podLines[++i] ?? "";
-    else if (pod && l === "Source:") pod.source = podLines[++i] ?? "";
-    else if (pod && l === "Elevation:") pod.elevation = podLines[++i] ?? "";
-    else if (pod && l === "UTM:") pod.utm = podLines[++i] ?? "";
-    else if (pod && l.startsWith("Stream Alteration Required:")) pod.stream_alteration_required = l.split(":")[1].trim();
+    } else if (pod && l.startsWith("Stream Alteration Required:")) {
+      pod.stream_alteration_required = l.split(":").slice(1).join(":").trim();
+    } else if (pod && l.endsWith(":")) {
+      // Peek ahead: only consume the next line as a value if it isn't another label
+      // or the start of a new POD. PODs commonly have label-only entries when the
+      // field is empty (Source:, Elevation:), and a naive ++i would eat the next label.
+      const key = l.slice(0, -1).trim();
+      const field = PodFieldMap[key];
+      if (field) {
+        const next = podLines[i + 1];
+        if (next && !next.endsWith(":") && !/^\(\d+\)/.test(next) && !next.startsWith("Stream Alteration Required:")) {
+          pod[field] = next;
+          i++;
+        }
+      }
+    }
   }
   if (pod) pods.push({ description: "", diverting_works: "", source: "", elevation: "", utm: "", stream_alteration_required: "", ...pod } as WrPod);
 
