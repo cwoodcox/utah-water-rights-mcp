@@ -41,7 +41,11 @@ async function dwrGet(path: string, params?: Record<string, string | number | bo
     }
   }
   const resp = await fetch(url.toString(), {
-    headers: { "Accept": "application/json" },
+    headers: {
+      ...BROWSER_HEADERS,
+      Accept: "application/json",
+      Referer: "https://waterrights.utah.gov/",
+    },
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
@@ -69,6 +73,29 @@ function priorityDate(raw: number | null | undefined): string | null {
 
 
 const WRINDEX_URL = "https://waterrights.utah.gov/cgi-bin/wrindex.exe";
+
+// wrindex.exe is picky: bare requests get blocked, but browser headers usually
+// suffice. Some searches still need a session cookie — we discover that lazily
+// by retrying with a warmed cookie when the first POST comes back empty.
+const BROWSER_HEADERS: Record<string, string> = {
+  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+
+async function wrindexWarmupCookie(): Promise<string> {
+  try {
+    const resp = await fetch(WRINDEX_URL, {
+      method: "GET",
+      headers: { ...BROWSER_HEADERS, Referer: "https://waterrights.utah.gov/" },
+      redirect: "follow",
+    });
+    const cookies = resp.headers.getSetCookie?.() ?? [];
+    return cookies.map((c: string) => c.split(";", 1)[0].trim()).filter(Boolean).join("; ");
+  } catch {
+    return "";
+  }
+}
 
 interface WrIndexRecord {
   owner: string;
@@ -209,26 +236,106 @@ function parseWrindexHtml(html: string): WrIndexRecord[] {
   return records;
 }
 
+async function wrindexFetch(bodyStr: string, cookie: string): Promise<string> {
+  const resp = await fetch(WRINDEX_URL, {
+    method: "POST",
+    headers: {
+      ...BROWSER_HEADERS,
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: "https://waterrights.utah.gov",
+      Referer: WRINDEX_URL,
+      ...(cookie ? { Cookie: cookie } : {}),
+    },
+    body: bodyStr,
+    redirect: "follow",
+  });
+  if (!resp.ok) throw new Error(`WRINDEX HTTP ${resp.status}`);
+  return resp.text();
+}
+
 async function wrindexPost(
   searchKey: "Owner Name" | "Text Search" | "Source of Supply" | "Text Source",
   searchString: string,
 ): Promise<{ records: WrIndexRecord[]; has_more: boolean }> {
-  const body = new URLSearchParams({
+  const bodyStr = new URLSearchParams({
     Modinfo: "WRMain",
     Search_Key: searchKey,
     SEARCH_STRING: searchString,
     Key: "Display Results",
-  });
-  const resp = await fetch(WRINDEX_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-  if (!resp.ok) throw new Error(`WRINDEX HTTP ${resp.status}`);
-  const html = await resp.text();
+  }).toString();
+
+  // First try with no cookie. wrindex.exe sometimes refuses without a session;
+  // if the parsed result is empty, warm a cookie and retry once.
+  let html = await wrindexFetch(bodyStr, "");
+  let records = parseWrindexHtml(html);
+  if (records.length === 0) {
+    const cookie = await wrindexWarmupCookie();
+    if (cookie) {
+      html = await wrindexFetch(bodyStr, cookie);
+      records = parseWrindexHtml(html);
+    }
+  }
+
   const has_more = html.includes('value="Next Page"') && html.includes('name="FIRST_');
-  return { records: parseWrindexHtml(html), has_more };
+  return { records, has_more };
 }
+
+// ── wrprint.asp / wrDB SQL surface ────────────────────────────────────────────
+// The /asp_apps/wrprint/ subsystem exposes an arbitrary-SELECT endpoint
+// (GET_MULTIPLE_VALUES) gated behind an ASPSESSIONID cookie. Form-encoded body,
+// keys: dbNameId, tableNameId, selectNameId, whereClauseId, orderClauseId.
+// Errors come back as single-quoted pseudo-JSON; success is real JSON.
+
+const WRPRINT_BASE = "https://waterrights.utah.gov/asp_apps/wrprint";
+
+async function wrprintCookie(): Promise<string> {
+  const resp = await fetch(`${WRPRINT_BASE}/wrprint.asp?wrnum=1-1`, {
+    method: "GET",
+    headers: { ...BROWSER_HEADERS, Referer: "https://waterrights.utah.gov/" },
+    redirect: "follow",
+  });
+  const cookies = resp.headers.getSetCookie?.() ?? [];
+  return cookies.map((c: string) => c.split(";", 1)[0].trim()).filter(Boolean).join("; ");
+}
+
+async function wrprintAjax(
+  endpoint: "GET_MULTIPLE_VALUES" | "GET_SCANNED_DOCUMENTS",
+  params: Record<string, string>,
+): Promise<{ records: Array<Record<string, string>>; count: number }> {
+  const cookie = await wrprintCookie();
+  if (!cookie) throw new Error("Failed to establish wrprint session");
+  const resp = await fetch(`${WRPRINT_BASE}/lclAjax.asp?xhrPost=${endpoint}`, {
+    method: "POST",
+    headers: {
+      ...BROWSER_HEADERS,
+      Cookie: cookie,
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: "https://waterrights.utah.gov",
+      Referer: `${WRPRINT_BASE}/wrprint.asp`,
+    },
+    body: new URLSearchParams(params).toString(),
+  });
+  if (!resp.ok) throw new Error(`wrprint ${endpoint} HTTP ${resp.status}`);
+  const raw = (await resp.text()).trim();
+
+  // {'Error':'...'} or {'RecordCount':'0'} — single-quoted pseudo-JSON
+  if (raw.startsWith("{'")) {
+    const err = raw.match(/'Error':'([^']*)'/);
+    if (err) throw new Error(`wrprint ${endpoint}: ${err[1]}`);
+    const cnt = raw.match(/'RecordCount':'(\d+)'/);
+    if (cnt) return { records: [], count: parseInt(cnt[1], 10) };
+  }
+
+  const parsed = JSON.parse(raw) as { Records?: Array<Record<string, string>>; RecordCount?: string };
+  const records = (parsed.Records ?? []).map((r) => {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(r)) out[k] = typeof v === "string" ? v.trim() : v;
+    return out;
+  });
+  return { records, count: parseInt(parsed.RecordCount ?? String(records.length), 10) };
+}
+
+const SAFE_WRNUM = /^[A-Za-z]?\d+(?:-\d+)?$/;
 
 function text(content: string) {
   return { content: [{ type: "text" as const, text: content }] };
@@ -660,6 +767,133 @@ Returns JSON with:
   );
 
 
+  // ── Tool: water right uses ───────────────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_water_right_uses",
+    {
+      title: "Get Water Right Use Allocations",
+      description: `Get the use-by-use breakdown for a specific water right number.
+
+Returns each USE_TYPE associated with the right (IRR=irrigation, DOM=domestic,
+STK=stockwater, MUN=municipal, MIN=mining, POW=power, OTH=other) along with the
+allocated quantity in that use's native unit (irrigation_acreage, stock_units,
+domestic_families, etc.) and the parallel ADJUD_* adjudicated values.
+
+This is the structured data behind a water right's detail page — equivalent to
+what waterrights.utah.gov shows in the "Uses" section of wrprint.asp.
+
+Returns: { wr_number, count, uses: [...] } — empty if the WR has no recorded uses.`,
+      inputSchema: {
+        wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '57-2634', '43-10040', 'E5428'"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ wr_number }) => {
+      try {
+        const { records, count } = await wrprintAjax("GET_MULTIPLE_VALUES", {
+          dbNameId: "wrDB",
+          tableNameId: "water_uses",
+          selectNameId: "wrnum, group_number, use_type, use_id, irrigation_acreage, domestic_families, domestic_persons, stock_units, municipality, mine_district, mine_name, power_plant_name, other_type, other_description, use_beg_date, use_end_date, adjud_irrigation_acreage, adjud_domestic_families, adjud_stock_units, adjud_municipality, adjud_action_flag",
+          whereClauseId: `WHERE wrnum='${wr_number}'`,
+          orderClauseId: "ORDER BY use_type, use_id",
+        });
+        return text(JSON.stringify({ wr_number, count, uses: records }, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
+  // ── Tool: scanned documents ──────────────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_scanned_documents",
+    {
+      title: "List Scanned Documents for a Water Right",
+      description: `List the scanned document index for a water right — applications, decrees,
+proofs, correspondence, legal documents, well driller's reports, etc.
+
+Each record has codedesc (human-readable doc type), docdate, comment, and a
+wwwpath + docfilen pair that points to the scanned image under /docSys/.
+
+Returns: { wr_number, count, documents: [{ doc_seq_n, docdate, doctype, codedesc, comment, volname, wwwpath, docfilen, ... }] }`,
+      inputSchema: {
+        wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '43-10040'"),
+        sort: z.enum(["doc_seq_n", "docdate", "codedesc", "doctype"]).default("doc_seq_n").describe("Sort key"),
+        order: z.enum(["asc", "desc"]).default("asc"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ wr_number, sort, order }) => {
+      try {
+        const { records, count } = await wrprintAjax("GET_SCANNED_DOCUMENTS", {
+          wrnum: wr_number,
+          sort,
+          order,
+        });
+        return text(JSON.stringify({ wr_number, count, documents: records }, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
+  // ── Tool: generic wrDB query ─────────────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_wrdb_query",
+    {
+      title: "Query wrDB Table (advanced)",
+      description: `Run an arbitrary SELECT against the DWR wrDB database via the wrprint
+GET_MULTIPLE_VALUES endpoint. Power tool — use the convenience tools first
+(uwr_water_right_uses, uwr_scanned_documents) when they fit.
+
+The endpoint composes \`SELECT {columns} FROM {table} {where_clause} {order_clause}\`.
+String literals in where_clause use single quotes, e.g. WHERE wrnum='57-2634'.
+
+Known tables (non-exhaustive):
+  - water_uses       — per-use breakdown for each WR. Key: WRNUM.
+                       Cols: GROUP_NUMBER, USE_TYPE, USE_ID, IRRIGATION_ACREAGE,
+                       DOMESTIC_FAMILIES, STOCK_UNITS, MUNICIPALITY, MINE_*,
+                       POWER_*, OTHER_*, plus parallel ADJUD_* columns,
+                       USE_BEG_DATE, USE_END_DATE, ADJUD_ACTION_FLAG.
+  - owners           — current/historical owners. Key: WRCHEX (NOT WRNUM —
+                       owners may be keyed by an exchange identifier like 'E5428';
+                       to find owners by WR number try WHERE wrchex LIKE '%<wrnum>%').
+                       Cols: OWNER_NAME, OWNER_FIRST_NAME, OWNER_LAST_NAME,
+                       OWNER_ADDRESS, OWNER_CITY, OWNER_STATE, OWNER_ZIPCODE,
+                       OWNER_PHONE, OWNER_EMAIL_ADDRESS, OWNER_INTEREST.
+
+To discover more tables, try \`tableNameId\` values and read the error response —
+"No RecordSet to convert to JSON" means the query failed (bad table/column/SQL).
+A successful unknown query returns { Records: [...], RecordCount }.
+
+Returns: { count, records: [...] } with all string values whitespace-trimmed.`,
+      inputSchema: {
+        table: z.string().min(1).describe("Table name, e.g. 'water_uses', 'owners'"),
+        columns: z.string().default("*").describe("SELECT clause body, e.g. 'wrnum, use_type' or 'TOP 10 *'"),
+        where_clause: z.string().default("").describe("Full WHERE clause including the word WHERE, e.g. \"WHERE wrnum='57-2634'\""),
+        order_clause: z.string().default("").describe("Full ORDER BY clause, e.g. 'ORDER BY use_type'"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ table, columns, where_clause, order_clause }) => {
+      try {
+        const { records, count } = await wrprintAjax("GET_MULTIPLE_VALUES", {
+          dbNameId: "wrDB",
+          tableNameId: table,
+          selectNameId: columns,
+          whereClauseId: where_clause,
+          orderClauseId: order_clause,
+        });
+        return text(JSON.stringify({ count, records }, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
   // ── Resource: place of use GIS layer ─────────────────────────────────────────
   // Tells agents to use ugrc-gis:arcgis_query_raw rather than a custom tool.
 
@@ -731,6 +965,9 @@ export default {
             "uwr_location_info",
             "uwr_search_by_owner",
             "uwr_search_by_source",
+            "uwr_water_right_uses",
+            "uwr_scanned_documents",
+            "uwr_wrdb_query",
             "uwr_waterway_network",
             "uwr_flowline_details",
             "uwr_accounting_graphs",
