@@ -488,6 +488,77 @@ async function wrPrintActionFetch(wrNumber: string): Promise<string> {
   return resp.text();
 }
 
+// ── Application trackers ──────────────────────────────────────────────────────
+// /applicationsrecords/{wr,ch,ex}AppTracker.asp render a server-side HTML table
+// of all applications acted on in the last 6 months. Rows are <tr id="rowN">
+// followed by <td>s; the last row has an inline legend table appended, so we
+// truncate to the first 13 cells per row.
+
+const APP_TRACKER_BASE = "https://waterrights.utah.gov/applicationsrecords";
+const APP_TRACKER_TYPES = {
+  water_right: "wrAppTracker.asp",
+  change: "chAppTracker.asp",
+  exchange: "exAppTracker.asp",
+} as const;
+type AppTrackerType = keyof typeof APP_TRACKER_TYPES;
+
+interface AppTrackerRow {
+  wr_number: string;
+  app_number: string;
+  applicant: string;
+  date_filed: string;
+  date_advertised: string;
+  date_protest_end: string;
+  protested: string;
+  status: string;
+  hearing_date: string;
+  progress_percent: string;
+  detail_url: string;
+}
+
+function parseAppTrackerHtml(html: string): { count: number; rows: AppTrackerRow[] } {
+  // Split on row IDs; first part is page chrome
+  const parts = html.split(/(?=id="row\d+">)/);
+  const rows: AppTrackerRow[] = [];
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i];
+    if (!p.startsWith('id="row')) continue;
+    const cellMatches = [...p.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].slice(0, 13);
+    const cells = cellMatches.map((m) => {
+      const t = m[1].replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+      return t;
+    });
+    if (cells.length < 12) continue;
+    const wrNumber = cells[1] ?? "";
+    const appNumberRaw = cells[3] ?? "";
+    const appNumber = appNumberRaw.replace(/^\(|\)$/g, "");
+    rows.push({
+      wr_number: wrNumber,
+      app_number: appNumber,
+      applicant: cells[4] ?? "",
+      date_filed: cells[5] ?? "",
+      date_advertised: cells[6] ?? "",
+      date_protest_end: cells[7] ?? "",
+      protested: cells[8] ?? "",
+      status: cells[9] ?? "",
+      hearing_date: cells[10] ?? "",
+      progress_percent: cells[11] ?? "",
+      detail_url: wrNumber ? `https://waterrights.utah.gov/search?q=${encodeURIComponent(wrNumber)}` : "",
+    });
+  }
+  return { count: rows.length, rows };
+}
+
+async function appTrackerFetch(type: AppTrackerType): Promise<string> {
+  const url = `${APP_TRACKER_BASE}/${APP_TRACKER_TYPES[type]}`;
+  const resp = await fetch(url, {
+    headers: { ...BROWSER_HEADERS, Referer: "https://waterrights.utah.gov/wrinfo/" },
+    redirect: "follow",
+  });
+  if (!resp.ok) throw new Error(`AppTracker HTTP ${resp.status}`);
+  return resp.text();
+}
+
 function text(content: string) {
   return { content: [{ type: "text" as const, text: content }] };
 }
@@ -1065,6 +1136,57 @@ Returns JSON with:
   );
 
 
+  // ── Tool: application tracker ────────────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_application_tracker",
+    {
+      title: "List Pending/Recent Water Right Applications",
+      description: `Pull the Utah DWR application tracker — every application acted on in the
+last ~6 months for one of three application types:
+
+  - "water_right" — new water right applications (wrAppTracker)
+  - "change"      — change applications (ownership/use changes; chAppTracker)
+  - "exchange"    — exchange applications (water trades; exAppTracker)
+
+Returns all applications in the default view (last 6 months window the DWR
+server controls). Use this to monitor: what's being filed in your area, what
+applications are protested or have hearings, what's near a deadline.
+
+Each row: { wr_number, app_number, applicant, date_filed, date_advertised,
+  date_protest_end, protested, status, hearing_date, progress_percent, detail_url }.
+
+Dates include relative-age annotations (e.g. "2025-10-08 (220d)"). Status
+values include "Not Protested", "Hearing Requested", "Hearing Held",
+"Approved", etc. progress_percent is a 0-100 lifecycle code (0=filed,
+50=publication verified, 70=hearing held, 95=final review, 100=complete).
+
+Apply your own filtering downstream — the response can be 500-900 rows for
+water_right type.`,
+      inputSchema: {
+        type: z.enum(["water_right", "change", "exchange"]).describe("Which tracker"),
+        limit: z.number().int().min(1).max(2000).default(200).describe("Cap rows returned (default 200)"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ type, limit }) => {
+      try {
+        const html = await appTrackerFetch(type);
+        const { count, rows } = parseAppTrackerHtml(html);
+        const sliced = rows.slice(0, limit);
+        return text(JSON.stringify({
+          type,
+          total_rows: count,
+          returned: sliced.length,
+          truncated: count > sliced.length,
+          rows: sliced,
+        }, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
   // ── Tool: water right master detail ──────────────────────────────────────────
 
   server.registerTool(
@@ -1329,6 +1451,7 @@ export default {
             "uwr_location_info",
             "uwr_search_by_owner",
             "uwr_search_by_source",
+            "uwr_application_tracker",
             "uwr_water_right_detail",
             "uwr_water_right_uses",
             "uwr_scanned_documents",
