@@ -1113,7 +1113,9 @@ Status codes: CERT=Certified, REJ=Rejected, APP=Approved, WUC=Water Use Certific
 
 RENDERING: This tool returns an HTML card at the end of its content. When this
 tool is called, pass that HTML directly to the show_widget tool for inline
-rendering. Do not summarize in prose.`,
+rendering. The card is the complete answer — after calling show_widget, end
+your turn immediately. Do not write any introduction, summary, recap, framing
+sentence, or follow-up commentary about what the card shows.`,
       inputSchema: {
         search_string: z.string().min(1).describe("Owner name to search for, e.g. 'O\'Leary', 'Utah Power', 'Bureau of Land Management'"),
         text_search: z.boolean().default(false).describe("If true, searches for substring anywhere in owner name. If false (default), alphabetical starting-point lookup."),
@@ -1167,7 +1169,9 @@ Returns JSON with:
 
 RENDERING: This tool returns an HTML card at the end of its content. When this
 tool is called, pass that HTML directly to the show_widget tool for inline
-rendering. Do not summarize in prose.`,
+rendering. The card is the complete answer — after calling show_widget, end
+your turn immediately. Do not write any introduction, summary, recap, framing
+sentence, or follow-up commentary about what the card shows.`,
       inputSchema: {
         search_string: z.string().min(1).describe("Source/spring/stream name to search, e.g. 'Hansel Valley', 'Salt Wells Spring', 'Bear River', 'Locomotive Springs'"),
         text_search: z.boolean().default(false).describe("If true, substring match anywhere in source name. If false (default), alphabetical starting-point lookup."),
@@ -1275,7 +1279,9 @@ Returns JSON with:
 
 RENDERING: This tool returns an HTML card at the end of its content. When this
 tool is called, pass that HTML directly to the show_widget tool for inline
-rendering. Do not summarize in prose.`,
+rendering. The card is the complete answer — after calling show_widget, end
+your turn immediately. Do not write any introduction, summary, recap, framing
+sentence, or follow-up commentary about what the card shows.`,
       inputSchema: {
         wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '43-10040', '57-2634'"),
       },
@@ -1349,7 +1355,9 @@ Returns: { wr_number, count, documents: [{ doc_seq_n, docdate, doctype, codedesc
 
 RENDERING: This tool returns an HTML card at the end of its content. When this
 tool is called, pass that HTML directly to the show_widget tool for inline
-rendering. Do not summarize in prose.`,
+rendering. The card is the complete answer — after calling show_widget, end
+your turn immediately. Do not write any introduction, summary, recap, framing
+sentence, or follow-up commentary about what the card shows.`,
       inputSchema: {
         wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '43-10040'"),
         sort: z.enum(["doc_seq_n", "docdate", "codedesc", "doctype"]).default("doc_seq_n").describe("Sort key"),
