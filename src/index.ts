@@ -516,33 +516,46 @@ interface AppTrackerRow {
   detail_url: string;
 }
 
-function parseAppTrackerHtml(html: string): { count: number; rows: AppTrackerRow[] } {
-  // Split on row IDs; first part is page chrome
-  const parts = html.split(/(?=id="row\d+">)/);
+function parseAppTrackerHtml(html: string, type: AppTrackerType): { count: number; rows: AppTrackerRow[] } {
+  // Schema differs by tracker type. water_right starts with WR# then has an
+  // empty details-button cell; change/exchange lead with the app# (a..., E...)
+  // then the base WR# wrapped in parens. Indices below are into the <td> array.
+  const schema = type === "water_right"
+    ? { wr: 1, app: 3, applicant: 4, filed: 5, advertised: 6, protest_end: 7, protested: 8, status: 9, hearing: 10, progress: 11 }
+    : { app: 1, wr: 2, applicant: 3, filed: 4, advertised: 5, protest_end: 6, protested: 7, status: 8, hearing: 9, progress: 10 };
+
+  // Exchange tracker emits `id="row1" >` with a space; tolerate it.
+  const parts = html.split(/(?=id="row\d+"\s*>)/);
   const rows: AppTrackerRow[] = [];
   for (let i = 1; i < parts.length; i++) {
     const p = parts[i];
     if (!p.startsWith('id="row')) continue;
     const cellMatches = [...p.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].slice(0, 13);
     const cells = cellMatches.map((m) => {
-      const t = m[1].replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+      const t = m[1]
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&#8209;/g, "-") // non-breaking hyphen in parenthesized WR numbers
+        .replace(/&amp;/g, "&")
+        .replace(/\s+/g, " ")
+        .trim();
       return t;
     });
-    if (cells.length < 12) continue;
-    const wrNumber = cells[1] ?? "";
-    const appNumberRaw = cells[3] ?? "";
-    const appNumber = appNumberRaw.replace(/^\(|\)$/g, "");
+    if (cells.length < 11) continue;
+    const stripParens = (s: string) => s.replace(/^\(|\)$/g, "").trim();
+    const wrNumber = stripParens(cells[schema.wr] ?? "");
+    const appNumber = stripParens(cells[schema.app] ?? "");
     rows.push({
       wr_number: wrNumber,
       app_number: appNumber,
-      applicant: cells[4] ?? "",
-      date_filed: cells[5] ?? "",
-      date_advertised: cells[6] ?? "",
-      date_protest_end: cells[7] ?? "",
-      protested: cells[8] ?? "",
-      status: cells[9] ?? "",
-      hearing_date: cells[10] ?? "",
-      progress_percent: cells[11] ?? "",
+      applicant: cells[schema.applicant] ?? "",
+      date_filed: cells[schema.filed] ?? "",
+      date_advertised: cells[schema.advertised] ?? "",
+      date_protest_end: cells[schema.protest_end] ?? "",
+      protested: cells[schema.protested] ?? "",
+      status: cells[schema.status] ?? "",
+      hearing_date: cells[schema.hearing] ?? "",
+      progress_percent: cells[schema.progress] ?? "",
       detail_url: wrNumber ? `https://waterrights.utah.gov/search?q=${encodeURIComponent(wrNumber)}` : "",
     });
   }
@@ -1172,7 +1185,7 @@ water_right type.`,
     async ({ type, limit }) => {
       try {
         const html = await appTrackerFetch(type);
-        const { count, rows } = parseAppTrackerHtml(html);
+        const { count, rows } = parseAppTrackerHtml(html, type);
         const sliced = rows.slice(0, limit);
         return text(JSON.stringify({
           type,
