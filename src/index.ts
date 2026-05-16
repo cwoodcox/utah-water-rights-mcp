@@ -1309,6 +1309,7 @@ Returns: { wr_number, count, uses: [...] } — empty if the WR has no recorded u
           dbNameId: "wrDB",
           tableNameId: "water_uses",
           selectNameId: "wrnum, group_number, use_type, use_id, irrigation_acreage, domestic_families, domestic_persons, stock_units, municipality, mine_district, mine_name, power_plant_name, other_type, other_description, use_beg_date, use_end_date, adjud_irrigation_acreage, adjud_domestic_families, adjud_stock_units, adjud_municipality, adjud_action_flag",
+          // Safe: Zod enforces SAFE_WRNUM format upstream.
           whereClauseId: `WHERE wrnum='${wr_number}'`,
           orderClauseId: "ORDER BY use_type, use_id",
         });
@@ -1416,7 +1417,7 @@ Returns: { count, records: [...] } with all string values whitespace-trimmed.`,
         where_clause: z.string().default("").describe("Full WHERE clause including the word WHERE, e.g. \"WHERE wrnum='57-2634'\""),
         order_clause: z.string().default("").describe("Full ORDER BY clause, e.g. 'ORDER BY use_type'"),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async ({ table, columns, where_clause, order_clause }) => {
       try {
@@ -1491,7 +1492,7 @@ Returns: { count, records: [...] } with all string values whitespace-trimmed.`,
 // ── Worker export ─────────────────────────────────────────────────────────────
 
 export default {
-  fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> | Response {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> | Response {
     const url = new URL(request.url);
 
     // Health check / info at root
@@ -1500,6 +1501,7 @@ export default {
         JSON.stringify({
           name: "Utah Water Rights MCP Server",
           mcp_endpoint: "/mcp",
+          // Tools list must be kept in sync manually when tools are added/removed.
           tools: [
             "uwr_county_codes",
             "uwr_location_info",
@@ -1526,6 +1528,11 @@ export default {
         }, null, 2),
         { headers: { "Content-Type": "application/json" } },
       );
+    }
+
+    // Explicit 404 for unknown paths
+    if (url.pathname !== "/mcp") {
+      return new Response("Not Found", { status: 404 });
     }
 
     // MCP endpoint — new server instance per request (stateless)

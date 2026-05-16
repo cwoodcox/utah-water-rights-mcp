@@ -1,7 +1,7 @@
 {
   "name": "utah-water-rights-mcp",
   "version": "1.0.0",
-  "description": "Utah Division of Water Rights MCP server \u2014 deployable to Cloudflare Workers",
+  "description": "Utah Division of Water Rights MCP server — deployable to Cloudflare Workers",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
@@ -14,7 +14,6 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250515.0",
     "typescript": "^5.8.3",
     "wrangler": "^4.14.0"
   }
