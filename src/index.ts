@@ -9,6 +9,12 @@
 import { createMcpHandler } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import {
+  renderWaterRightCard,
+  renderSearchResultsCard,
+  renderScannedDocsCard,
+  htmlResource,
+} from "./cards.js";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -596,6 +602,10 @@ function text(content: string) {
   return { content: [{ type: "text" as const, text: content }] };
 }
 
+function textWithCard(content: string, uri: string, html: string) {
+  return { content: [{ type: "text" as const, text: content }, htmlResource(uri, html)] };
+}
+
 // ── Server factory (one per request) ─────────────────────────────────────────
 
 function createServer(): McpServer {
@@ -1110,12 +1120,16 @@ Status codes: CERT=Certified, REJ=Rejected, APP=Approved, WUC=Water Use Certific
       try {
         const searchKey = text_search ? "Text Search" : "Owner Name";
         const { records, has_more } = await wrindexPost(searchKey, search_string);
-        return text(JSON.stringify({
+        const payload = {
           total_found: records.length,
           has_more,
           note: has_more ? "More results exist. Narrow your search or use a more specific name." : undefined,
           records,
-        }, null, 2));
+        };
+        const card = renderSearchResultsCard({
+          mode: "owner", query: search_string, total_found: records.length, has_more, records,
+        });
+        return textWithCard(JSON.stringify(payload, null, 2), `ui://uwr/search/owner/${encodeURIComponent(search_string)}`, card);
       } catch (e) {
         return text(formatError(e));
       }
@@ -1156,12 +1170,16 @@ Returns JSON with:
       try {
         const searchKey = text_search ? "Text Source" : "Source of Supply";
         const { records, has_more } = await wrindexPost(searchKey, search_string);
-        return text(JSON.stringify({
+        const payload = {
           total_found: records.length,
           has_more,
           note: has_more ? "More results exist. Try a more specific source name." : undefined,
           records,
-        }, null, 2));
+        };
+        const card = renderSearchResultsCard({
+          mode: "source", query: search_string, total_found: records.length, has_more, records,
+        });
+        return textWithCard(JSON.stringify(payload, null, 2), `ui://uwr/search/source/${encodeURIComponent(search_string)}`, card);
       } catch (e) {
         return text(formatError(e));
       }
@@ -1255,7 +1273,8 @@ Returns JSON with:
       try {
         const html = await wrPrintActionFetch(wr_number);
         const parsed = parseWrPrintAction(html, wr_number);
-        return text(JSON.stringify(parsed, null, 2));
+        const card = renderWaterRightCard(parsed);
+        return textWithCard(JSON.stringify(parsed, null, 2), `ui://uwr/wr/${encodeURIComponent(wr_number)}`, card);
       } catch (e) {
         return text(formatError(e));
       }
@@ -1337,7 +1356,9 @@ Returns: { wr_number, count, documents: [{ doc_seq_n, docdate, doctype, codedesc
             pdf_url: `https://www.waterrights.utah.gov/asp_apps/DOCDB/DocImageToPDF.asp?file=${filePath}`,
           };
         });
-        return text(JSON.stringify({ wr_number, count, documents }, null, 2));
+        const payload = { wr_number, count, documents };
+        const card = renderScannedDocsCard(wr_number, count, documents);
+        return textWithCard(JSON.stringify(payload, null, 2), `ui://uwr/docs/${encodeURIComponent(wr_number)}`, card);
       } catch (e) {
         return text(formatError(e));
       }
