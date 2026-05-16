@@ -508,6 +508,90 @@ async function wrPrintActionFetch(wrNumber: string): Promise<string> {
   return resp.text();
 }
 
+// ── Application trackers ──────────────────────────────────────────────────────
+// /applicationsrecords/{wr,ch,ex}AppTracker.asp render a server-side HTML table
+// of all applications acted on in the last 6 months. Rows are <tr id="rowN">
+// followed by <td>s; the last row has an inline legend table appended, so we
+// truncate to the first 13 cells per row.
+
+const APP_TRACKER_BASE = "https://waterrights.utah.gov/applicationsrecords";
+const APP_TRACKER_TYPES = {
+  water_right: "wrAppTracker.asp",
+  change: "chAppTracker.asp",
+  exchange: "exAppTracker.asp",
+} as const;
+type AppTrackerType = keyof typeof APP_TRACKER_TYPES;
+
+interface AppTrackerRow {
+  wr_number: string;
+  app_number: string;
+  applicant: string;
+  date_filed: string;
+  date_advertised: string;
+  date_protest_end: string;
+  protested: string;
+  status: string;
+  hearing_date: string;
+  progress_percent: string;
+  detail_url: string;
+}
+
+function parseAppTrackerHtml(html: string, type: AppTrackerType): { count: number; rows: AppTrackerRow[] } {
+  // Schema differs by tracker type. water_right starts with WR# then has an
+  // empty details-button cell; change/exchange lead with the app# (a..., E...)
+  // then the base WR# wrapped in parens. Indices below are into the <td> array.
+  const schema = type === "water_right"
+    ? { wr: 1, app: 3, applicant: 4, filed: 5, advertised: 6, protest_end: 7, protested: 8, status: 9, hearing: 10, progress: 11 }
+    : { app: 1, wr: 2, applicant: 3, filed: 4, advertised: 5, protest_end: 6, protested: 7, status: 8, hearing: 9, progress: 10 };
+
+  // Exchange tracker emits `id="row1" >` with a space; tolerate it.
+  const parts = html.split(/(?=id="row\d+"\s*>)/);
+  const rows: AppTrackerRow[] = [];
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i];
+    if (!p.startsWith('id="row')) continue;
+    const cellMatches = [...p.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].slice(0, 13);
+    const cells = cellMatches.map((m) => {
+      const t = m[1]
+        .replace(/<[^>]+>/g, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&#8209;/g, "-") // non-breaking hyphen in parenthesized WR numbers
+        .replace(/&amp;/g, "&")
+        .replace(/\s+/g, " ")
+        .trim();
+      return t;
+    });
+    if (cells.length < 11) continue;
+    const stripParens = (s: string) => s.replace(/^\(|\)$/g, "").trim();
+    const wrNumber = stripParens(cells[schema.wr] ?? "");
+    const appNumber = stripParens(cells[schema.app] ?? "");
+    rows.push({
+      wr_number: wrNumber,
+      app_number: appNumber,
+      applicant: cells[schema.applicant] ?? "",
+      date_filed: cells[schema.filed] ?? "",
+      date_advertised: cells[schema.advertised] ?? "",
+      date_protest_end: cells[schema.protest_end] ?? "",
+      protested: cells[schema.protested] ?? "",
+      status: cells[schema.status] ?? "",
+      hearing_date: cells[schema.hearing] ?? "",
+      progress_percent: cells[schema.progress] ?? "",
+      detail_url: wrNumber ? `https://waterrights.utah.gov/search?q=${encodeURIComponent(wrNumber)}` : "",
+    });
+  }
+  return { count: rows.length, rows };
+}
+
+async function appTrackerFetch(type: AppTrackerType): Promise<string> {
+  const url = `${APP_TRACKER_BASE}/${APP_TRACKER_TYPES[type]}`;
+  const resp = await fetch(url, {
+    headers: { ...BROWSER_HEADERS, Referer: "https://waterrights.utah.gov/wrinfo/" },
+    redirect: "follow",
+  });
+  if (!resp.ok) throw new Error(`AppTracker HTTP ${resp.status}`);
+  return resp.text();
+}
+
 function text(content: string) {
   return { content: [{ type: "text" as const, text: content }] };
 }
@@ -1085,6 +1169,57 @@ Returns JSON with:
   );
 
 
+  // ── Tool: application tracker ────────────────────────────────────────────────
+
+  server.registerTool(
+    "uwr_application_tracker",
+    {
+      title: "List Pending/Recent Water Right Applications",
+      description: `Pull the Utah DWR application tracker — every application acted on in the
+last ~6 months for one of three application types:
+
+  - "water_right" — new water right applications (wrAppTracker)
+  - "change"      — change applications (ownership/use changes; chAppTracker)
+  - "exchange"    — exchange applications (water trades; exAppTracker)
+
+Returns all applications in the default view (last 6 months window the DWR
+server controls). Use this to monitor: what's being filed in your area, what
+applications are protested or have hearings, what's near a deadline.
+
+Each row: { wr_number, app_number, applicant, date_filed, date_advertised,
+  date_protest_end, protested, status, hearing_date, progress_percent, detail_url }.
+
+Dates include relative-age annotations (e.g. "2025-10-08 (220d)"). Status
+values include "Not Protested", "Hearing Requested", "Hearing Held",
+"Approved", etc. progress_percent is a 0-100 lifecycle code (0=filed,
+50=publication verified, 70=hearing held, 95=final review, 100=complete).
+
+Apply your own filtering downstream — the response can be 500-900 rows for
+water_right type.`,
+      inputSchema: {
+        type: z.enum(["water_right", "change", "exchange"]).describe("Which tracker"),
+        limit: z.number().int().min(1).max(2000).default(200).describe("Cap rows returned (default 200)"),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ type, limit }) => {
+      try {
+        const html = await appTrackerFetch(type);
+        const { count, rows } = parseAppTrackerHtml(html, type);
+        const sliced = rows.slice(0, limit);
+        return text(JSON.stringify({
+          type,
+          total_rows: count,
+          returned: sliced.length,
+          truncated: count > sliced.length,
+          rows: sliced,
+        }, null, 2));
+      } catch (e) {
+        return text(formatError(e));
+      }
+    },
+  );
+
   // ── Tool: water right master detail ──────────────────────────────────────────
 
   server.registerTool(
@@ -1349,6 +1484,7 @@ export default {
             "uwr_location_info",
             "uwr_search_by_owner",
             "uwr_search_by_source",
+            "uwr_application_tracker",
             "uwr_water_right_detail",
             "uwr_water_right_uses",
             "uwr_scanned_documents",
