@@ -1109,7 +1109,11 @@ Returns JSON with:
 
 Type codes: APPL=Application, DIL=Diligence Claim, SHAR=Shares, DEC=Decree, EXCH=Exchange
 Status codes: CERT=Certified, REJ=Rejected, APP=Approved, WUC=Water Use Certificate,
-              WD=Withdrawn, DIS=Dismissed, NPR=No Priority, LAP=Lapsed`,
+              WD=Withdrawn, DIS=Dismissed, NPR=No Priority, LAP=Lapsed
+
+RENDERING: This tool returns an HTML card at the end of its content. When this
+tool is called, pass that HTML directly to the show_widget tool for inline
+rendering. Do not summarize in prose.`,
       inputSchema: {
         search_string: z.string().min(1).describe("Owner name to search for, e.g. 'O\'Leary', 'Utah Power', 'Bureau of Land Management'"),
         text_search: z.boolean().default(false).describe("If true, searches for substring anywhere in owner name. If false (default), alphabetical starting-point lookup."),
@@ -1159,7 +1163,11 @@ substring matching (e.g. "Wells" finds "Salt Wells", "Gravel Wells", etc.).
 Returns JSON with:
   total_found, has_more,
   records: [{ owner, source, wr_number, type, status, app_number,
-              priority_date, flow_cfs, volume_acft, detail_url }]`,
+              priority_date, flow_cfs, volume_acft, detail_url }]
+
+RENDERING: This tool returns an HTML card at the end of its content. When this
+tool is called, pass that HTML directly to the show_widget tool for inline
+rendering. Do not summarize in prose.`,
       inputSchema: {
         search_string: z.string().min(1).describe("Source/spring/stream name to search, e.g. 'Hansel Valley', 'Salt Wells Spring', 'Bear River', 'Locomotive Springs'"),
         text_search: z.boolean().default(false).describe("If true, substring match anywhere in source name. If false (default), alphabetical starting-point lookup."),
@@ -1263,7 +1271,11 @@ Returns JSON with:
     stream_alteration_required }],
   general: {…raw label→value from General section…},
   dates: {…raw label→value from Dates section…},
-  detail_url.`,
+  detail_url.
+
+RENDERING: This tool returns an HTML card at the end of its content. When this
+tool is called, pass that HTML directly to the show_widget tool for inline
+rendering. Do not summarize in prose.`,
       inputSchema: {
         wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '43-10040', '57-2634'"),
       },
@@ -1333,7 +1345,11 @@ Each record includes two retrieval URLs:
   - direct_url: raw scan (TIF/PDF) — useful for image-based viewing
 
 Returns: { wr_number, count, documents: [{ doc_seq_n, docdate, doctype, codedesc,
-  comment, volname, recordid, pdf_url, direct_url, ... }] }`,
+  comment, volname, recordid, pdf_url, direct_url, ... }] }
+
+RENDERING: This tool returns an HTML card at the end of its content. When this
+tool is called, pass that HTML directly to the show_widget tool for inline
+rendering. Do not summarize in prose.`,
       inputSchema: {
         wr_number: z.string().regex(SAFE_WRNUM).describe("Water right number, e.g. '43-10040'"),
         sort: z.enum(["doc_seq_n", "docdate", "codedesc", "doctype"]).default("doc_seq_n").describe("Sort key"),
