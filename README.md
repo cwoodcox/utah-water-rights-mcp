@@ -1,6 +1,6 @@
 # Utah Water Rights MCP Server
 
-A remote MCP server that exposes the Utah Division of Water Rights' public data — managed-system accounting, the statewide WRINDEX legacy database, and per-WR scanned documents — as 13 read-only MCP tools. Runs on Cloudflare Workers; no auth, no state, no database.
+A remote MCP server that exposes the Utah Division of Water Rights' public data — managed-system accounting, the statewide WRINDEX legacy database, the application tracker, and per-WR scanned documents — as 20 read-only MCP tools. Runs on Cloudflare Workers; no auth, no state, no database.
 
 **Endpoint after deploy:** `https://utah-diwr-mcp.<your-account>.workers.dev/mcp`
 
@@ -11,7 +11,9 @@ A few questions the tool composition is designed to answer:
 - *Who holds water rights on Hansel Valley Springs?* → `uwr_search_by_source("Hansel Valley")` (managed accounting doesn't cover closed-basin sources — WRINDEX does)
 - *What's on this parcel?* → `uwr_location_info` → `uwr_waterway_network` → `uwr://place-of-use/layer-info` for the irrigation polygon overlay
 - *How much Bear River water was diverted to irrigation in 2023?* → `uwr_allocations_summary` with `system_name="Bear River"`
-- *Show me every document filed for WR 57-2634* → `uwr_scanned_documents`
+- *Show me every document filed for WR 57-2634* → `uwr_scanned_documents`, with the full master record from `uwr_water_right_detail`
+- *What water-right applications were filed in my county in the last 6 months?* → `uwr_application_tracker` with `type="water_right"`
+- *Plot Echo Reservoir storage over the irrigation season* → `uwr_reservoir_storage` for the smoothed timeseries
 - *Find a specific column not exposed as a convenience tool* → `uwr_wrdb_query` against `owners`, `water_uses`, etc.
 
 ## Tools
@@ -27,26 +29,38 @@ The server wraps three distinct DWR surfaces. Pick the right one for your questi
 | `uwr_waterway_network` | List hydrographic features (streams, canals, ditches, tunnels) in a lat/lon bounding box, with WKT geometry. |
 | `uwr_flowline_details` | Full metadata for a single waterway by flowline ID. |
 
-### Distribution accounting (managed river systems only)
+### Distribution accounting — structure and balances (managed river systems only)
 
 | Tool | Description |
 |---|---|
 | `uwr_accounting_graphs` | List managed water systems (Bear River, Weber, Provo, …) and their zone IDs. |
+| `uwr_accounting_graph_detail` | Structure of a stored accounting graph for a date range — zones plus the flows between them. |
 | `uwr_allocations` | Query individual allocations with rich filtering: water right number, from/to zone, system, date range, min volume. Paginated. |
 | `uwr_allocations_summary` | Aggregate totals/counts/averages across allocations without paging. |
 | `uwr_zone_balance` | Account balance time series for a single zone (stream reach or irrigation area). |
 
-### Static WR database (full statewide coverage — WRINDEX legacy)
+### Distribution accounting — daily timeseries
 
 | Tool | Description |
 |---|---|
-| `uwr_search_by_owner` | Find water rights by owner/entity name. Alphabetical lookup by default, substring with `text_search=true`. |
+| `uwr_zone_apportionments` | Per-variable daily timeseries for a zone (inflows, outflows, allocations, depletions). Supports `cfs`/`acft` units and direction filtering. |
+| `uwr_zone_totals` | Pre-aggregated daily totals per zone across all inflow/outflow paths. |
+| `uwr_flow_apportionments` | Per-variable daily timeseries for a single inter-zone flow (canal headgate, diversion, etc.). |
+| `uwr_reservoir_storage` | Kalman-smoothed reservoir storage volume timeseries, corrected by measured inflows/outflows. |
+
+### Static WR database + application tracker (full statewide coverage)
+
+| Tool | Description |
+|---|---|
+| `uwr_search_by_owner` | Find water rights by owner/entity name via the WRINDEX legacy DB. Alphabetical lookup by default, substring with `text_search=true`. |
 | `uwr_search_by_source` | Find water rights drawing from a named source — the only way to reach unmanaged/closed-basin sources (e.g. Hansel Valley Springs, Salt Wells Spring). |
+| `uwr_application_tracker` | Pull the DWR application tracker for `water_right`, `change`, or `exchange` applications acted on in the last ~6 months — applicant, status, protest/hearing dates, progress code. |
 
 ### Per-water-right detail (wrprint AJAX / wrDB)
 
 | Tool | Description |
 |---|---|
+| `uwr_water_right_detail` | Full master record for a WR: priority date, quantity, source, county, owners, change applications, points of diversion with UTM coordinates, lifecycle milestone dates. |
 | `uwr_water_right_uses` | Use-by-use breakdown for a WR number — irrigation acreage, stock units, domestic families, municipal, mining, power, with parallel adjudicated values. |
 | `uwr_scanned_documents` | Scanned document index for a WR — applications, decrees, proofs, correspondence, well-driller reports — with paths into `/docSys/`. |
 | `uwr_wrdb_query` | Power tool: arbitrary `SELECT` against wrDB (e.g. `owners`, `water_uses`). Use convenience tools first; this is for tables they don't cover. |
@@ -118,3 +132,6 @@ Data sources accessed:
 - `/api/distribution-accounting/` — allocations, zone balances (managed systems only)
 - `/cgi-bin/wrindex.exe` — legacy static WR database; HTML responses parsed in-worker. Sometimes requires a session cookie, so the WRINDEX tools transparently retry with a warmed cookie when the first request comes back empty.
 - `/asp_apps/wrprint/lclAjax.asp` — per-WR detail (uses, scanned documents, arbitrary wrDB SELECT). Requires an `ASPSESSIONID` cookie obtained on each request; error responses come back as single-quoted pseudo-JSON which the worker normalizes.
+- `/applicationsrecords/*AppTracker.asp` — server-rendered application-tracker HTML, parsed into structured rows by the worker.
+
+The reverse-engineering notes behind these surfaces — endpoint catalog, wrDB schema, confirmed dead-end tables, scanned-doc URL construction, WRCHEX-vs-WRNUM gotcha, decision tree for "where does this data live" — live in [`docs/dwr-reverse-engineering.md`](docs/dwr-reverse-engineering.md). Read it before adding new tools.
