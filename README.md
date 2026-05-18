@@ -1,8 +1,18 @@
 # Utah Water Rights MCP Server
 
-A remote MCP server for the Utah Division of Water Rights public API, deployable to Cloudflare Workers in one command.
+A remote MCP server that exposes the Utah Division of Water Rights' public data — managed-system accounting, the statewide WRINDEX legacy database, and per-WR scanned documents — as 13 read-only MCP tools. Runs on Cloudflare Workers; no auth, no state, no database.
 
-**Endpoint after deploy:** `https://utah-water-rights-mcp.<your-account>.workers.dev/mcp`
+**Endpoint after deploy:** `https://utah-diwr-mcp.<your-account>.workers.dev/mcp`
+
+## What you can do with it
+
+A few questions the tool composition is designed to answer:
+
+- *Who holds water rights on Hansel Valley Springs?* → `uwr_search_by_source("Hansel Valley")` (managed accounting doesn't cover closed-basin sources — WRINDEX does)
+- *What's on this parcel?* → `uwr_location_info` → `uwr_waterway_network` → `uwr://place-of-use/layer-info` for the irrigation polygon overlay
+- *How much Bear River water was diverted to irrigation in 2023?* → `uwr_allocations_summary` with `system_name="Bear River"`
+- *Show me every document filed for WR 57-2634* → `uwr_scanned_documents`
+- *Find a specific column not exposed as a convenience tool* → `uwr_wrdb_query` against `owners`, `water_uses`, etc.
 
 ## Tools
 
@@ -49,18 +59,21 @@ The server wraps three distinct DWR surfaces. Pick the right one for your questi
 
 ## Deploy
 
+Prerequisites: a Cloudflare account and `wrangler login` (one-time).
+
 ```bash
 npm install
 npm run deploy
 ```
 
-That's it. No secrets, no Durable Objects — fully stateless, reads from `waterrights.utah.gov` public API.
+No secrets, no Durable Objects, no KV — fully stateless. The worker name (`utah-diwr-mcp`) and `compatibility_date` live in `wrangler.jsonc`; edit them before your first deploy if you want a different subdomain.
 
 ## Local dev
 
 ```bash
 npm run dev
 # Server at http://localhost:8787/mcp
+# Root (http://localhost:8787/) returns a JSON manifest with the tool list.
 ```
 
 Test with MCP Inspector:
@@ -77,7 +90,7 @@ After deploying, add to your MCP client config:
 {
   "mcpServers": {
     "utah-water-rights": {
-      "url": "https://utah-water-rights-mcp.<your-account>.workers.dev/mcp"
+      "url": "https://utah-diwr-mcp.<your-account>.workers.dev/mcp"
     }
   }
 }
@@ -85,20 +98,23 @@ After deploying, add to your MCP client config:
 
 For clients that only support stdio (not remote URLs), use `mcp-remote` as a proxy:
 ```bash
-npx mcp-remote https://utah-water-rights-mcp.<your-account>.workers.dev/mcp
+npx mcp-remote https://utah-diwr-mcp.<your-account>.workers.dev/mcp
 ```
 
 ## Architecture
 
-Uses `createMcpHandler` from Cloudflare's `agents` SDK — a new server instance is created per request, keeping the Worker completely stateless. No Durable Objects or session state needed since all tools are read-only API calls.
+Uses `createMcpHandler` from Cloudflare's `agents` SDK — a new `McpServer` is created per request, so the Worker holds no state between calls. All tools are read-only HTTP fetches against `waterrights.utah.gov`.
 
 ```
-MCP Client → Streamable HTTP → Cloudflare Worker → waterrights.utah.gov API
+MCP Client → Streamable HTTP → Cloudflare Worker → waterrights.utah.gov
+                                                   ├─ /api/*               (clean JSON)
+                                                   ├─ /cgi-bin/wrindex.exe (HTML, scraped)
+                                                   └─ /asp_apps/wrprint/   (AJAX, session-cookied)
 ```
 
 Data sources accessed:
 - `/api/map-utilities/` — coordinate → area resolution
 - `/api/wr-net/hydrography/` — waterway network geometry
 - `/api/distribution-accounting/` — allocations, zone balances (managed systems only)
-- `/cgi-bin/wrindex.exe` — legacy static WR database (owner/source search, full statewide coverage)
-- `/asp_apps/wrprint/lclAjax.asp` — per-WR detail (uses, scanned documents, arbitrary wrDB SELECT)
+- `/cgi-bin/wrindex.exe` — legacy static WR database; HTML responses parsed in-worker. Sometimes requires a session cookie, so the WRINDEX tools transparently retry with a warmed cookie when the first request comes back empty.
+- `/asp_apps/wrprint/lclAjax.asp` — per-WR detail (uses, scanned documents, arbitrary wrDB SELECT). Requires an `ASPSESSIONID` cookie obtained on each request; error responses come back as single-quoted pseudo-JSON which the worker normalizes.
