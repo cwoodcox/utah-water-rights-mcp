@@ -37,7 +37,7 @@ The application tracker is a fourth, narrower surface: server-rendered HTML at `
 - **SQL safety in `uwr_wrdb_query` and `uwr_water_right_uses`.** Where-clauses interpolate user input into single-quoted SQL strings. The `wr_number` parameter is regex-validated upstream by `SAFE_WRNUM` (`/^[A-Za-z]?\d+(?:-\d+)?$/`). Don't relax that regex without thinking through injection vectors against wrDB.
 - **WRINDEX session-cookie behavior is non-deterministic.** Some queries work cold, others need a warmed cookie. The empty-then-retry pattern in `wrindexPost` is the working compromise — don't replace it with eager warming (extra round trip on every call) or no warming (random empty results).
 - **`agents/mcp` only loads in the Workers runtime.** Don't import it from Node scripts. Test through `wrangler dev` or against the deployed Worker.
-- **`worker-configuration.d.ts` is generated** by `npx wrangler types` and is `.gitignore`'d. Re-run after adding bindings.
+- **`worker-configuration.d.ts` is generated** by `npx wrangler types` (script: `npm run cf-typegen`) and is `.gitignore`'d. Re-run after adding bindings. Fresh clones need to run it once before `tsc --noEmit` will pass; the Worker bundle itself doesn't need it.
 - **The lockfile is committed.** `npm clean-install` is what CF runs — peer-dep conflicts (e.g. zod major mismatches) will fail the build. If you bump a dep with peers, run `npm install` locally and commit the lockfile.
 
 ## When extending
