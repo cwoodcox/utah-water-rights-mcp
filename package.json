@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "Utah Division of Water Rights MCP server — deployable to Cloudflare Workers",
   "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
@@ -11,7 +15,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "agents": "^0.12.4",
-    "zod": "^3.24.1"
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "typescript": "^5.8.3",
